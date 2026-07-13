@@ -14,9 +14,6 @@ import logging
 import os
 import re
 import shutil
-import subprocess
-import time
-from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -81,23 +78,6 @@ def _update_frontmatter_date(content: str, field: str, value: str) -> str:
     if pattern.search(content):
         return pattern.sub(rf"\1 {value}", content)
     return content
-
-
-def _git_commit_and_push(message: str) -> dict:
-    """Git add, commit, and push. Returns {'ok': True, 'output': '...'} or {'ok': False, 'error': '...'}."""
-    try:
-        subprocess.run(["git", "add", "-A"], cwd=VAULT_ROOT.parent, capture_output=True, text=True, timeout=30)
-        commit = subprocess.run(["git", "commit", "-m", message], cwd=VAULT_ROOT.parent, capture_output=True, text=True, timeout=30)
-        push = subprocess.run(["git", "push"], cwd=VAULT_ROOT.parent, capture_output=True, text=True, timeout=30)
-        out = (commit.stdout or commit.stderr or "").strip()
-        push_out = (push.stdout or push.stderr or "").strip()
-        return {"ok": True, "output": out, "push": push_out}
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "error": "timed out"}
-    except FileNotFoundError:
-        return {"ok": False, "error": "git not found"}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
 
 
 # ── Tool implementations ──────────────────────────────────────────
@@ -201,7 +181,6 @@ async def _vault_create(
 
     filepath.parent.mkdir(parents=True, exist_ok=True)
     _write_file(filepath, full_content)
-    _git_commit_and_push(f"scribble: create {filename}")
 
     return {
         "path": str(filepath.relative_to(VAULT_ROOT)),
@@ -244,7 +223,6 @@ async def _vault_append(path_glob: str, content: str, section: str | None = None
 
     new_content = f"---{new_fm}---\n{new_body}\n"
     _write_file(filepath, new_content)
-    _git_commit_and_push(f"scribble: append to {filepath.name}")
 
     return {
         "path": str(filepath.relative_to(VAULT_ROOT)),
@@ -264,8 +242,7 @@ async def _vault_delete(path_glob: str) -> dict:
     filepath = matches[0]
     rel = str(filepath.relative_to(VAULT_ROOT))
     filepath.unlink()
-    git = _git_commit_and_push(f"scribble: delete {filepath.name}")
-    return {"path": rel, "status": "deleted", "git": git.get("output", "")}
+    return {"path": rel, "status": "deleted"}
 
 
 # ── MCP server wiring ─────────────────────────────────────────────
@@ -378,7 +355,7 @@ def _build_server() -> Server:
             ),
             Tool(
                 name="vault_delete",
-                description="Delete a note by path glob. Must match exactly one file. Commits and pushes the deletion to git.",
+                description="Delete a note by path glob. Must match exactly one file.",
                 inputSchema={
                     "type": "object",
                     "properties": {
