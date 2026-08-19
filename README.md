@@ -1,100 +1,103 @@
-# Scribble MCP 📝
+# Scribble MCP Vault API
 
-A lightweight MCP server for reading, searching, and writing to a markdown LLM wiki vault. Designed for LLM agents that need persistent knowledge storage.
+The repository name is historical. The implementation is current: a small, dependency-free HTTP API used by Claude's n8n MCP vault workflows.
 
-https://github.com/chiam-ck/scribble-mcp
+## Production architecture
 
-## Features
+```text
+Claude MCP
+  → n8n on tech-vm
+  → HTTP over private Tailscale
+  → vault-api.service on agentic-vm
+  → /home/ck/icloud-linux-mount/Obsidian/Ck's Vault
+  → iCloud
+```
 
-| Tool | Description |
-|------|-------------|
-| `vault_list` | List notes, optionally filtered by type (concept, entity, comparison, query, raw) |
-| `vault_read` | Read a note by exact path or glob pattern |
-| `vault_search` | Full-text search across all markdown files with snippets |
-| `vault_create` | Create a new note with proper YAML frontmatter and date-prefixed filename |
-| `vault_append` | Append content to an existing note, auto-bumping the `updated` date |
+The Mac mini and SSH are not part of the vault path.
 
-## Quick Start
+## Production service
+
+The user service runs `vault_api.py` from this repository:
+
+```text
+/home/ck/repo/scribble-mcp/vault_api.py
+/home/ck/.config/systemd/user/vault-api.service
+```
+
+It binds to `100.78.128.119:8765` in production. The API checks that both the mount and `icloud.service` are active before every vault operation. If either check fails, it returns an error and does not write.
+
+Start or inspect it on `agentic-vm`:
 
 ```bash
-# Install
-git clone https://github.com/chiam-ck/scribble-mcp.git
-cd scribble-mcp
-uv venv && source .venv/bin/activate && uv pip install -e .
-
-# Run as stdio MCP server
-python -m scribble_mcp
-
-# Or run the HTTP server (for webhook integration)
-python vault_api.py
+systemctl --user daemon-reload
+systemctl --user enable --now vault-api.service
+systemctl --user status vault-api.service
+curl http://100.78.128.119:8765/health
 ```
 
-### Claude Desktop / Claude Code
+For a local development process, the defaults bind to loopback:
 
-Add to your MCP config:
-
-```json
-{
-  "mcpServers": {
-    "scribble-wiki": {
-      "command": "python3",
-      "args": ["-m", "scribble_mcp"],
-      "cwd": "/path/to/scribble-mcp"
-    }
-  }
-}
+```bash
+python3 vault_api.py
 ```
 
-## Configuration
+To bind explicitly:
 
-Copy `.env.example` to `.env` and customize:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `VAULT_API_PORT` | `8999` | HTTP server port (only used for webhook mode) |
-| `VAULT_API_HOST` | `0.0.0.0` | HTTP server bind address |
-| `VAULT_PATH` | `~/vault/wiki` | Path to your markdown wiki vault |
-
-## Vault Structure
-
-The vault expects a directory of markdown files organized by type:
-
-```
-wiki/
-├── concepts/       # Knowledge topics
-├── entities/       # Named things (people, projects, places)
-├── comparisons/    # Side-by-side analyses
-├── queries/        # Saved Q&A pairs
-└── raw/            # Source materials
+```bash
+python3 vault_api.py 100.78.128.119 8765
 ```
 
-Files follow the naming convention `YYYY-MM-DD-descriptive-slug.md` with YAML frontmatter:
+## API contract
 
-```yaml
----
-title: Page Title
-created: 2025-01-01
-updated: 2025-01-01
-type: concept
-tags: [tag1, tag2]
-sources: []
----
+All paths are relative to the vault root. Path traversal and absolute paths are rejected.
+
+| Method | Endpoint | Request | Purpose |
+|---|---|---|---|
+| GET | `/health` | none | Check mount and service health |
+| GET | `/vault/read?path=wiki/SCHEMA.md` | none | Read a file |
+| GET | `/vault/list?path=wiki/` | none | List a directory |
+| GET | `/vault/search?q=frontmatter&path=wiki/` | none | Case-sensitive regex search |
+| POST | `/vault/write` | `{path, content}` | Write or overwrite a file |
+| POST | `/vault/append` | `{path, content}` | Append to a file |
+| POST | `/vault/delete` | `{path}` | Delete a file |
+| POST | `/vault/move` | `{from, to}` | Move or rename a file |
+
+The n8n MCP workflow parameter names are part of the contract:
+
+- Search uses `q`
+- Move uses `from` and `to`
+- Write and append use `path` and `content`
+- Delete uses `path`
+
+## Write safety
+
+- The mount and `icloud.service` are checked before every operation.
+- Writes use direct file operations through the FUSE mount.
+- Existing files are not replaced through a generic temp-file-plus-rename workflow.
+- After writes, inspect the iCloud journal for `file-sync-complete`:
+
+```bash
+journalctl --user -u icloud.service -n 80 --no-pager
 ```
 
-## HTTP API (Webhook Mode)
+Do not add an SSH fallback or a second vault copy.
 
-For integration with n8n or other platforms that can't run stdio MCP:
+## n8n verification
 
-```
-GET  /health         — Health check
-GET  /list?type=X    — List notes by type
-GET  /read?path=X    — Read a specific note
-GET  /search?q=X     — Full-text search
-POST /create         — Create a note (JSON body)
-POST /append         — Append to a note (JSON body)
-POST /               — Legacy format (operation/directory/query/path/content)
+From `tech-vm`:
+
+```bash
+docker exec n8n node -e 'fetch("http://100.78.128.119:8765/health").then(async r => console.log(r.status, await r.text()))'
 ```
 
-## License
+The seven live workflows are:
 
-MIT
+- `Vault Read - MCP`
+- `Vault Write - MCP`
+- `Vault Append - MCP`
+- `Vault Delete - MCP`
+- `Vault Move - MCP`
+- `Vault List - MCP`
+- `Vault Search - MCP`
+
+For an end-to-end check, use a temporary file under `wiki/`, exercise write, read, append, move, and delete, then confirm the file is gone. Also exercise list and search. Never leave test files in the vault.

@@ -1,19 +1,9 @@
 [project]
 name = "scribble-mcp"
-version = "0.1.0"
-description = "MCP server for an LLM Wiki Vault — read, search, and append to knowledge notes"
-requires-python = ">=3.12"
-dependencies = [
-    "mcp>=1.0",
-    "python-dotenv>=1.0",
-]
+version = "1.0.0"
+description = "Direct HTTP API for the Ubuntu-mounted iCloud Obsidian vault"
+requires-python = ">=3.11"
+dependencies = []
 
 [project.scripts]
-scribble-mcp = "scribble_mcp.__main__:main"
-
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/scribble_mcp"]
+vault-api = "vault_api:main"

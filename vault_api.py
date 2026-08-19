@@ -1,277 +1,195 @@
-"""Lightweight HTTP server wrapping vault operations for n8n to call."""
-
+#!/usr/bin/env python3
+"""Minimal direct HTTP API for the Ubuntu-mounted iCloud Obsidian vault."""
 from __future__ import annotations
 
+import base64
 import json
-import logging
 import os
-from pathlib import Path
-from typing import Any
-
-from starlette.applications import Starlette
-from starlette.middleware import Middleware
-from starlette.middleware.cors import CORSMiddleware
-from starlette.requests import Request
-from starlette.responses import JSONResponse, PlainTextResponse
-from starlette.routing import Route
-
-# Reuse vault functions from the MCP server
+import re
+import subprocess
 import sys
-sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
 
-from scribble_mcp.server import (
-    _vault_list,
-    _vault_read,
-    _vault_search,
-    _vault_create,
-    _vault_append,
-    _vault_delete,
-    VAULT_ROOT,
-)
-
-_LOG = logging.getLogger("vault_api")
+VAULT = Path("/home/ck/icloud-linux-mount/Obsidian/Ck's Vault")
+MOUNT = Path("/home/ck/icloud-linux-mount")
+SERVICE = "icloud.service"
+MAX_BODY = 20 * 1024 * 1024
 
 
-# ── Handlers ──────────────────────────────────────────────────────
+def service_ready() -> tuple[bool, str]:
+    if not MOUNT.is_mount():
+        return False, "iCloud mount is unavailable"
+    result = subprocess.run(
+        ["systemctl", "--user", "is-active", "--quiet", SERVICE],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    if result.returncode != 0:
+        return False, "icloud.service is not active"
+    return True, "ok"
 
-async def handle_list(request: Request) -> JSONResponse:
-    note_type = request.query_params.get("type")
+
+def safe_path(value: str, *, allow_empty: bool = False) -> Path:
+    value = unquote(value or "")
+    if not value and allow_empty:
+        return VAULT
+    if not value or value.startswith("/") or "\x00" in value:
+        raise ValueError("relative vault path required")
+    candidate = (VAULT / value).resolve()
     try:
-        notes = await _vault_list(note_type)
-        return JSONResponse({"ok": True, "count": len(notes), "notes": notes})
-    except Exception as e:
-        _LOG.exception("list failed")
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+        candidate.relative_to(VAULT.resolve())
+    except ValueError as exc:
+        raise ValueError("path traversal rejected") from exc
+    return candidate
 
 
-async def handle_read(request: Request) -> JSONResponse:
-    path_glob = request.query_params.get("path", "")
-    if not path_glob:
-        return JSONResponse({"ok": False, "error": "Missing 'path' query param"}, status_code=400)
-    try:
-        results = await _vault_read(path_glob)
-        return JSONResponse({"ok": True, "count": len(results), "notes": results})
-    except Exception as e:
-        _LOG.exception("read failed")
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+def relative(path: Path) -> str:
+    return path.relative_to(VAULT.resolve()).as_posix()
 
 
-async def handle_search(request: Request) -> JSONResponse:
-    query = request.query_params.get("q", "")
-    if not query:
-        return JSONResponse({"ok": False, "error": "Missing 'q' query param"}, status_code=400)
-    try:
-        max_results = int(request.query_params.get("max", "20"))
-    except ValueError:
-        max_results = 20
-    try:
-        results = await _vault_search(query, max_results)
-        return JSONResponse({"ok": True, "count": len(results), "results": results})
-    except Exception as e:
-        _LOG.exception("search failed")
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+def json_body(handler: BaseHTTPRequestHandler) -> dict:
+    length = int(handler.headers.get("Content-Length", "0"))
+    if length > MAX_BODY:
+        raise ValueError("request body too large")
+    raw = handler.rfile.read(length) if length else b"{}"
+    data = json.loads(raw.decode("utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("JSON object required")
+    return data
 
 
-async def handle_create(request: Request) -> JSONResponse:
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"ok": False, "error": "Invalid JSON body"}, status_code=400)
-
-    title = body.get("title")
-    note_type = body.get("type")
-    content = body.get("content", "")
-    tags = body.get("tags", [])
-    sources = body.get("sources", [])
-
-    if not title or not note_type:
-        return JSONResponse(
-            {"ok": False, "error": "Missing required fields: title, type"},
-            status_code=400,
-        )
-
-    try:
-        result = await _vault_create(title, note_type, content, tags, sources)
-        if "error" in result:
-            return JSONResponse({"ok": False, "error": result["error"]}, status_code=400)
-        return JSONResponse({"ok": True, **result})
-    except Exception as e:
-        _LOG.exception("create failed")
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+def write_text(path: Path, content: str, *, append: bool = False) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = "a" if append else "w"
+    with path.open(mode, encoding="utf-8", newline="") as handle:
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
-async def handle_append(request: Request) -> JSONResponse:
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"ok": False, "error": "Invalid JSON body"}, status_code=400)
+class Handler(BaseHTTPRequestHandler):
+    server_version = "VaultAPI/1.0"
 
-    path_glob = body.get("path")
-    content = body.get("content", "")
-    section = body.get("section")
+    def reply(self, code: int, body: str, content_type: str = "text/plain; charset=utf-8") -> None:
+        payload = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
 
-    if not path_glob or not content:
-        return JSONResponse(
-            {"ok": False, "error": "Missing required fields: path, content"},
-            status_code=400,
-        )
+    def error(self, code: int, message: str) -> None:
+        self.reply(code, message + "\n", "text/plain; charset=utf-8")
 
-    try:
-        result = await _vault_append(path_glob, content, section)
-        if "error" in result:
-            return JSONResponse({"ok": False, "error": result["error"]}, status_code=400)
-        return JSONResponse({"ok": True, **result})
-    except Exception as e:
-        _LOG.exception("append failed")
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+    def require_ready(self) -> None:
+        ready, reason = service_ready()
+        if not ready:
+            raise RuntimeError(reason)
 
-
-async def handle_delete(request: Request) -> JSONResponse:
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"ok": False, "error": "Invalid JSON body"}, status_code=400)
-
-    path_glob = body.get("path")
-    if not path_glob:
-        return JSONResponse({"ok": False, "error": "Missing required field: path"}, status_code=400)
-
-    try:
-        result = await _vault_delete(path_glob)
-        if "error" in result:
-            return JSONResponse({"ok": False, "error": result["error"]}, status_code=400)
-        return JSONResponse({"ok": True, **result})
-    except Exception as e:
-        _LOG.exception("delete failed")
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
-
-
-async def handle_health(_request: Request) -> PlainTextResponse:
-    """Health check — also reports vault stats."""
-    try:
-        notes = await _vault_list(None)
-        return PlainTextResponse(
-            f"OK | vault: {VAULT_ROOT} | notes: {len(notes)}"
-        )
-    except Exception as e:
-        return PlainTextResponse(f"ERROR: {e}", status_code=500)
-
-
-async def handle_legacy_post(request: Request) -> JSONResponse:
-    """Handle legacy POST format used by the old n8n Vault Wiki - MCP workflow.
-    Accepts: {"operation": "list|read|write|search", ...}
-    """
-    import traceback
-    try:
-        raw = await request.json()
-    except Exception as e:
-        _LOG.error("Invalid JSON from %s: %s", request.client, traceback.format_exc())
-        return JSONResponse({"success": False, "error": f"Invalid JSON: {e}"}, status_code=400)
-
-    _LOG.info("Legacy POST raw body: %s", json.dumps(raw)[:500])
-    # n8n wraps the POST body in an array [{...}] or a {"body": ...} envelope
-    if isinstance(raw, list):
-        entry = raw[0] if raw else {}
-        # n8n may also wrap array elements in {"body": ...}
-        if isinstance(entry, dict) and "body" in entry:
-            entry = entry["body"]
-    elif isinstance(raw, dict):
-        entry = raw.get("body", raw)
-    else:
-        entry = {}
-    op = entry.get("operation", "")
-    _LOG.info("Legacy POST operation: %s", op)
-
-    if op == "list":
-        target = entry.get("directory", "")
-        if target:
-            # Map directory names to note types (accept both plural and singular)
-            dir_to_type = {
-                "concepts": "concept", "concept": "concept",
-                "entities": "entity", "entity": "entity",
-                "comparisons": "comparison", "comparison": "comparison",
-                "queries": "query", "query": "query",
-                "raw": "raw",
-            }
-            note_type = dir_to_type.get(target)
-            if note_type:
-                notes = await _vault_list(note_type)
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        try:
+            if parsed.path == "/health":
+                ready, reason = service_ready()
+                self.reply(200 if ready else 503, reason + "\n")
+                return
+            self.require_ready()
+            if parsed.path == "/vault/read":
+                path = safe_path(query.get("path", [""])[0])
+                self.reply(200, path.read_text(encoding="utf-8", errors="replace"))
+            elif parsed.path == "/vault/list":
+                path = safe_path(query.get("path", [""])[0], allow_empty=True)
+                if not path.is_dir():
+                    raise ValueError("directory required")
+                entries = []
+                for child in sorted(path.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower())):
+                    suffix = "/" if child.is_dir() else ""
+                    entries.append(relative(child) + suffix)
+                self.reply(200, "\n".join(entries) + ("\n" if entries else ""))
+            elif parsed.path == "/vault/search":
+                needle = query.get("q", [""])[0]
+                if not needle:
+                    raise ValueError("search query required")
+                base = safe_path(query.get("path", [""])[0], allow_empty=True)
+                pattern = re.compile(needle)
+                roots = [base] if base.is_file() else base.rglob("*")
+                matches = []
+                for candidate in roots:
+                    if not candidate.is_file() or candidate.name.startswith("."):
+                        continue
+                    try:
+                        text = candidate.read_text(encoding="utf-8", errors="replace")
+                    except OSError:
+                        continue
+                    if pattern.search(text):
+                        matches.append(relative(candidate))
+                self.reply(200, "\n".join(sorted(matches)) + ("\n" if matches else ""))
             else:
-                return JSONResponse({"success": False, "error": f"Unknown directory '{target}'. Valid: concepts, entities, comparisons, queries, raw"})
-        else:
-            notes = await _vault_list(None)
-        return JSONResponse({"success": True, "entries": notes, "count": len(notes)})
-    elif op == "read":
-        fp = entry.get("path", "")
-        results = await _vault_read(fp)
-        if not results or "error" in results[0]:
-            return JSONResponse({"success": False, "error": results[0]["error"]}, status_code=404)
-        return JSONResponse({"success": True, "content": results[0]["content"], "path": fp})
-    elif op == "search":
-        q = entry.get("query", "")
-        results = await _vault_search(q)
-        return JSONResponse({"success": True, "results": results, "count": len(results)})
-    elif op == "write":
-        fp = entry.get("path", "")
-        content = entry.get("content", "")
-        filepath = VAULT_ROOT / fp
-        filepath.parent.mkdir(parents=True, exist_ok=True)
-        filepath.write_text(content, encoding="utf-8")
-        return JSONResponse({"success": True, "path": fp, "write_ok": True})
-    elif op == "delete":
-        result = await _vault_delete(entry.get("path", ""))
-        if "error" in result:
-            return JSONResponse({"success": False, "error": result["error"]})
-        return JSONResponse({"success": True, **result})
+                self.error(404, "not found")
+        except (ValueError, json.JSONDecodeError) as exc:
+            self.error(400, str(exc))
+        except (FileNotFoundError, NotADirectoryError) as exc:
+            self.error(404, str(exc))
+        except PermissionError as exc:
+            self.error(403, str(exc))
+        except RuntimeError as exc:
+            self.error(503, str(exc))
+        except Exception as exc:
+            self.error(500, str(exc))
 
-    return JSONResponse({"success": False, "error": f"Unknown operation: {op}"}, status_code=400)
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        try:
+            self.require_ready()
+            data = json_body(self)
+            if parsed.path == "/vault/write":
+                path = safe_path(str(data["path"]))
+                write_text(path, str(data["content"]))
+                self.reply(200, "ok\n")
+            elif parsed.path == "/vault/append":
+                path = safe_path(str(data["path"]))
+                write_text(path, str(data["content"]), append=True)
+                self.reply(200, "ok\n")
+            elif parsed.path == "/vault/delete":
+                path = safe_path(str(data["path"]))
+                path.unlink()
+                self.reply(200, "ok\n")
+            elif parsed.path == "/vault/move":
+                source = safe_path(str(data["from"]))
+                destination = safe_path(str(data["to"]))
+                if destination.exists():
+                    raise FileExistsError("destination already exists")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                source.rename(destination)
+                self.reply(200, "ok\n")
+            else:
+                self.error(404, "not found")
+        except (KeyError, ValueError, json.JSONDecodeError) as exc:
+            self.error(400, str(exc))
+        except (FileNotFoundError, NotADirectoryError) as exc:
+            self.error(404, str(exc))
+        except FileExistsError as exc:
+            self.error(409, str(exc))
+        except PermissionError as exc:
+            self.error(403, str(exc))
+        except RuntimeError as exc:
+            self.error(503, str(exc))
+        except Exception as exc:
+            self.error(500, str(exc))
 
-
-async def handle_index(_request: Request) -> JSONResponse:
-    """List available endpoints."""
-    return JSONResponse({
-        "service": "vault-api",
-        "vault": str(VAULT_ROOT),
-        "endpoints": {
-            "GET  /": "This index",
-            "GET  /health": "Health check",
-            "GET  /list": "List notes (?type=concept|entity|comparison|query|raw)",
-            "GET  /read": "Read note (?path=concepts/*marathon*)",
-            "GET  /search": "Search notes (?q=query&max=20)",
-            "POST /create": "Create note (JSON body)",
-            "POST /append": "Append to note (JSON body)",
-            "POST /delete": "Delete note (JSON body: {\"path\": \"...\"})",
-        },
-    })
-
-
-# ── App ───────────────────────────────────────────────────────────
-
-routes = [
-    Route("/", endpoint=handle_index, methods=["GET"]),
-    Route("/health", endpoint=handle_health),
-    Route("/list", endpoint=handle_list),
-    Route("/read", endpoint=handle_read),
-    Route("/search", endpoint=handle_search),
-    Route("/create", endpoint=handle_create, methods=["POST"]),
-    Route("/append", endpoint=handle_append, methods=["POST"]),
-    Route("/delete", endpoint=handle_delete, methods=["POST"]),
-    Route("/", endpoint=handle_legacy_post, methods=["POST"]),
-]
-
-middleware = [
-    Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]),
-]
-
-app = Starlette(routes=routes, middleware=middleware)
+    def log_message(self, fmt: str, *args: object) -> None:
+        sys.stderr.write("vault-api: " + (fmt % args) + "\n")
 
 
-# ── CLI entry point ───────────────────────────────────────────────
+def main() -> None:
+    host = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("VAULT_API_HOST", "127.0.0.1")
+    port = int(sys.argv[2]) if len(sys.argv) > 2 else int(os.environ.get("VAULT_API_PORT", "8765"))
+    ThreadingHTTPServer((host, port), Handler).serve_forever()
+
 
 if __name__ == "__main__":
-    from dotenv import load_dotenv
-    load_dotenv()
-    import uvicorn
-    port = int(os.environ.get("VAULT_API_PORT", "9003"))
-    host = os.environ.get("VAULT_API_HOST", "0.0.0.0")
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    main()

@@ -1,0 +1,15 @@
+[Unit]
+Description=Direct HTTP API for the Ubuntu-mounted iCloud Obsidian vault
+After=network-online.target icloud.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ck/repo/scribble-mcp
+ExecStart=/usr/bin/python3 /home/ck/repo/scribble-mcp/vault_api.py 100.78.128.119 8765
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
